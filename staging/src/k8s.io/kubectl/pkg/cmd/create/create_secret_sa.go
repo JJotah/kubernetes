@@ -18,6 +18,8 @@ package create
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -30,17 +32,33 @@ import (
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util"
+	"k8s.io/kubectl/pkg/util/hash"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
 
 var (
-	secretForSaLong = templates.LongDesc(i18n.T(`
-		Create a new secret for use in Service Accounts as a token.`))
+	secretForDockerRegistryLong = templates.LongDesc(i18n.T(`
+		Create a new secret for use with Docker registries.
 
-	secretForSaExample = templates.Examples(i18n.T(`
+		Dockercfg secrets are used to authenticate against Docker registries.
+
+		When using the Docker command line to push images, you can authenticate to a given registry by running:
+			'$ docker login DOCKER_REGISTRY_SERVER --username=DOCKER_USER --password=DOCKER_PASSWORD --email=DOCKER_EMAIL'.
+
+	That produces a ~/.dockercfg file that is used by subsequent 'docker push' and 'docker pull' commands to
+		authenticate to the registry. The email address is optional.
+
+		When creating applications, you may have a Docker registry that requires authentication.  In order for the
+		nodes to pull images on your behalf, they must have the credentials.  You can provide this information
+		by creating a dockercfg secret and attaching it to your service account.`))
+
+	secretForDockerRegistryExample = templates.Examples(i18n.T(`
 		  # If you don't already have a .dockercfg file, you can create a dockercfg secret directly by using:
-		  kubectl create secret token-sa my-secret --serviceaccount=serviceaccount`))
+		  kubectl create secret docker-registry my-secret --docker-server=DOCKER_REGISTRY_SERVER --docker-username=DOCKER_USER --docker-password=DOCKER_PASSWORD --docker-email=DOCKER_EMAIL
+
+		  # Create a new secret named my-secret from ~/.docker/config.json
+		  kubectl create secret docker-registry my-secret --from-file=.dockerconfigjson=path/to/.docker/config.json`))
 )
 
 // CreateSecretTokenSaOptions holds the options for 'create secret docker-registry' sub command
@@ -57,7 +75,6 @@ type CreateSecretTokenSaOptions struct {
 	FieldManager     string
 	CreateAnnotation bool
 	Namespace        string
-	Annotations      []string
 	EnforceNamespace bool
 
 	Client              corev1client.CoreV1Interface
@@ -68,25 +85,16 @@ type CreateSecretTokenSaOptions struct {
 	genericclioptions.IOStreams
 }
 
-// NewSecretDockerRegistryOptions creates a new *CreateSecretTokenSaOptions with default value
-func NewSecretSaOptions(ioStreams genericclioptions.IOStreams) *CreateSecretTokenSaOptions {
-	return &CreateSecretTokenSaOptions{
-		ServiceAccount:     "test-sa",
-		PrintFlags: genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme),
-		IOStreams:  ioStreams,
-	}
-}
-
-// NewSecretSaOptions is a macro command for creating secrets to work with Docker registries
-func NewCmdCreateSa(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
-	o := NewSecretSaOptions(ioStreams)
+// NewCmdCreateSecretTokenSa is a macro command for creating secrets to work with Docker registries
+func NewCmdCreateSecretTokenSa(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
+	o := CreateSecretTokenSaOptions(ioStreams)
 
 	cmd := &cobra.Command{
 		Use:                   "token-sa NAME --serviceaccount=serviceaccount",
 		DisableFlagsInUseLine: true,
 		Short:                 i18n.T("Create a secret token for service account"),
-		Long:                  secretForSaLong,
-		Example:               secretForSaExample,
+		Long:                  secretForDockerRegistryLong,
+		Example:               secretForDockerRegistryExample,
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(o.Complete(f, cmd, args))
 			cmdutil.CheckErr(o.Validate())
@@ -100,7 +108,10 @@ func NewCmdCreateSa(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *c
 	cmdutil.AddValidateFlags(cmd)
 	cmdutil.AddDryRunFlag(cmd)
 
-	cmd.Flags().StringVar(&o.ServiceAccount, "serviceaccount", o.ServiceAccount, i18n.T("ServiceAccount that will create token"))
+	cmd.Flags().StringVar(&o.ServiceAccount, "serviceaccount", o.Username, i18n.T("ServiceAccount that will create token"))
+	cmd.Flags().BoolVar(&o.AppendHash, "append-hash", o.AppendHash, "Append a hash of the secret to its name.")
+	cmd.Flags().StringSliceVar(&o.FileSources, "from-file", o.FileSources, "Key files can be specified using their file path, in which case a default name will be given to them, or optionally with a name and file path, in which case the given name will be used.  Specifying a directory will iterate each named file in the directory that is a valid secret key.")
+
 	cmdutil.AddFieldManagerFlagVar(cmd, &o.FieldManager, "kubectl-create")
 
 	return cmd
@@ -171,7 +182,7 @@ func (o *CreateSecretTokenSaOptions) Validate() error {
 	if len(o.Name) == 0 {
 		return fmt.Errorf("name must be specified")
 	}
-	if (len(o.ServiceAccount) == 0) {
+	if len(o.FileSources) == 0 && (len(o.ServiceAccount) == 0) {
 		return fmt.Errorf("either --serviceaccount is required")
 	}
 	return nil
@@ -180,11 +191,11 @@ func (o *CreateSecretTokenSaOptions) Validate() error {
 // Run calls createSecretDockerRegistry which will create secretDockerRegistry based on CreateSecretTokenSaOptions
 // and makes an API call to the server
 func (o *CreateSecretTokenSaOptions) Run() error {
-	secretSa, err := o.createSecretSa()
+	secretDockerRegistry, err := o.createSecretDockerRegistry()
 	if err != nil {
 		return err
 	}
-	err = util.CreateOrUpdateAnnotation(o.CreateAnnotation, secretSa, scheme.DefaultJSONEncoder())
+	err = util.CreateOrUpdateAnnotation(o.CreateAnnotation, secretDockerRegistry, scheme.DefaultJSONEncoder())
 	if err != nil {
 		return err
 	}
@@ -195,36 +206,46 @@ func (o *CreateSecretTokenSaOptions) Run() error {
 		}
 		createOptions.FieldValidation = o.ValidationDirective
 		if o.DryRunStrategy == cmdutil.DryRunServer {
-			err := o.DryRunVerifier.HasSupport(secretSa.GroupVersionKind())
+			err := o.DryRunVerifier.HasSupport(secretDockerRegistry.GroupVersionKind())
 			if err != nil {
 				return err
 			}
 			createOptions.DryRun = []string{metav1.DryRunAll}
 		}
-		secretSa, err = o.Client.Secrets(o.Namespace).Create(context.TODO(), secretSa, createOptions)
+		secretDockerRegistry, err = o.Client.Secrets(o.Namespace).Create(context.TODO(), secretDockerRegistry, createOptions)
 		if err != nil {
 			return fmt.Errorf("failed to create secret %v", err)
 		}
 	}
 
-	return o.PrintObj(secretSa)
+	return o.PrintObj(secretDockerRegistry)
 }
 
 // createSecretDockerRegistry fills in key value pair from the information given in
 // CreateSecretDockerRegistryOptions into *corev1.Secret
-func (o *CreateSecretTokenSaOptions) createSecretSa() (*corev1.Secret, error) {
+func (o *CreateSecretDockerRegistryOptions) createSecretDockerRegistry() (*corev1.Secret, error) {
 	namespace := ""
 	if o.EnforceNamespace {
 		namespace = o.Namespace
 	}
-	annotations := o.buildAnnotations()
-	secretSa := newSecretObjToken(o.Name, namespace, corev1.SecretTypeServiceAccountToken, annotations)
-
-	return secretSa, nil
-}
-
-func (o *CreateSecretTokenSaOptions) buildAnnotations() map[string]string {
-	var annotations = make(map[string]string)
-    annotations["kubernetes.io/service-account.name"] = o.ServiceAccount
-	return annotations
+	secretDockerRegistry := newSecretObj(o.Name, namespace, corev1.SecretTypeServiceAccountToken)
+	if len(o.FileSources) > 0 {
+		if err := handleSecretFromFileSources(secretDockerRegistry, o.FileSources); err != nil {
+			return nil, err
+		}
+	} else {
+		dockerConfigJSONContent, err := handleDockerCfgJSONContent(o.Username, o.Password, o.Email, o.Server)
+		if err != nil {
+			return nil, err
+		}
+		secretDockerRegistry.Data[corev1.DockerConfigJsonKey] = dockerConfigJSONContent
+	}
+	if o.AppendHash {
+		hash, err := hash.SecretHash(secretDockerRegistry)
+		if err != nil {
+			return nil, err
+		}
+		secretDockerRegistry.Name = fmt.Sprintf("%s-%s", secretDockerRegistry.Name, hash)
+	}
+	return secretDockerRegistry, nil
 }

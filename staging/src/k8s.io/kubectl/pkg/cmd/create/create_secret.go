@@ -326,7 +326,7 @@ func newSecretObj(name, namespace string, secretType corev1.SecretType) *corev1.
 			},
 			Type: secretType,
 			Data: map[string][]byte{},
-			ServiceAccount: 
+			ServiceAccount: string,
 		}
 	}
 }
