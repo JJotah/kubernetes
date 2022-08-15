@@ -301,17 +301,33 @@ func (o *CreateSecretOptions) createSecret() (*corev1.Secret, error) {
 
 // newSecretObj will create a new Secret Object given name, namespace and secretType
 func newSecretObj(name, namespace string, secretType corev1.SecretType) *corev1.Secret {
-	return &corev1.Secret{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: corev1.SchemeGroupVersion.String(),
-			Kind:       "Secret",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Type: secretType,
-		Data: map[string][]byte{},
+	if secretType != "SecretTypeServiceAccountToken" {
+		return &corev1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: corev1.SchemeGroupVersion.String(),
+				Kind:       "Secret",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+			},
+			Type: secretType,
+			Data: map[string][]byte{},
+		}
+	}else{
+		return &corev1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: corev1.SchemeGroupVersion.String(),
+				Kind:       "Secret",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+			},
+			Type: secretType,
+			Data: map[string][]byte{},
+			ServiceAccount: 
+		}
 	}
 }
 
